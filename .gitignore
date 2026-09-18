@@ -1,0 +1,51 @@
+# ── 凭据与隐私：全部禁止入库（规格 §12 受保护文件清单）──
+.env
+credentials.json
+token.json
+*.credential.json
+
+# 手工放置的明文凭证文件（例如 网易邮箱.txt）
+# 这类文件不该进版本库；连同常见的凭证命名一并拦掉。
+*邮箱*.txt
+*账号*.txt
+*密码*.txt
+*授权*.txt
+*credential*.txt
+*secret*.txt
+
+# 数据与备份（含脱敏正文片段）
+data/
+*.db
+*.db-wal
+*.db-shm
+*.db.bak
+
+# 输出：摘要等内容
+out/
+
+# 日志
+logs/
+*.log
+
+# 测试样本（可能含真实邮件内容）
+tests/fixtures/*.eml
+!tests/fixtures/README.md
+
+# LLM 请求/响应缓存
+.cache/
+llm_cache/
+
+# 开发过程产物：AI 助手生成的会话计划草稿，非项目源码
+.zcode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/

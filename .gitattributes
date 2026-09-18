@@ -1,0 +1,13 @@
+# 换行符规范化：仓库内统一 LF，避免跨平台（Windows 检出）产生整文件 diff。
+# PowerShell 脚本保留 CRLF —— Windows PowerShell 的默认换行约定，
+# 而 scripts/*.ps1 的注释已说明该目录对文件格式敏感。
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制/生成物不做换行转换
+*.png binary
+*.ico binary
+*.db binary
+*.exe binary
