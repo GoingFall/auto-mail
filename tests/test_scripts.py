@@ -161,9 +161,18 @@ def test_install_tasks_uses_fixed_runner_path() -> None:
 
 
 def test_readme_documents_task_installation() -> None:
-    """README 必须告诉使用者如何安装任务计划。"""
+    """使用者必须能从 README 找到「如何安装任务计划」。
+
+    内容本身已按读者分流到命令行指南（README 变薄、只做入口），因此这里
+    断言的是**可发现性**：README 指向该指南，且指南确实讲了安装方式。
+    只查文件是否存在会让「文档被删了测试还绿」。
+    """
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "install-tasks.ps1" in readme
+    assert "guide-cli.md" in readme, "README 必须提供通往命令行指南的入口"
+
+    guide = PROJECT_ROOT / "docs" / "guide-cli.md"
+    assert guide.exists(), "README 指向的命令行指南必须存在"
+    assert "install-tasks.ps1" in guide.read_text(encoding="utf-8")
 
 
 def test_install_tasks_passes_schedule_args_individually() -> None:
