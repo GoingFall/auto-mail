@@ -21,6 +21,8 @@
   - [一次 `run` 的执行与并发安全](#一次-run-的执行与并发安全)
   - [三层账本与幂等键](#三层账本与幂等键)
 - [快速开始](#快速开始)
+- [典型使用流程](#典型使用流程)
+- [两种使用方式](#两种使用方式)
 - [图形界面](#图形界面)
 - [命令一览](#命令一览)
 - [抽取质量](#抽取质量实测)
@@ -30,8 +32,11 @@
 - [隐私与安全](#隐私与安全)
 - [定时运行](#定时运行windows-任务计划)
 - [已知限制](#已知限制163-服务端行为)
-- [开发与测试](#开发)
+- [开发](#开发)
 - [路线图](#路线图)
+
+> 全文含 7 张 Mermaid 图：架构、数据流、抽取分层、状态机（正常路径 / 异常路径各一张）、
+> 并发时序、GUI 线程模型。所有图均可直接在 GitHub 上渲染，无需插件。
 
 ---
 
@@ -42,56 +47,58 @@
 
 ```mermaid
 flowchart TB
-    subgraph L1["① 入口层"]
-        direction LR
-        CLIENTRY["automail CLI<br/>typer + rich"]
-        GUIENTRY["图形界面<br/>auto-mail-gui.exe"]
-        TASKENTRY["Windows 任务计划<br/>scripts/run.ps1"]
+    CLI["CLI / GUI / 任务计划"]
+    PIPE["Pipeline<br/>TTL 单实例锁"]
+
+    subgraph BIZ["业务层"]
+        SYNC["SyncEngine"]
+        EXT["ExtractRunner"]
+        REVQ["ReviewQueue"]
+        PUSH["PushEngine"]
+        MR["mark_read"]
     end
 
-    subgraph L2["② 编排层"]
-        direction LR
-        PIPE["Pipeline · automail run<br/>sync → extract → push → mark-read → digest<br/>TTL 单实例锁 ｜ 阶段互不阻塞"]
-        WORKER["GUI Worker<br/>非守护线程 + 队列"]
+    subgraph ADP["适配层"]
+        IMAPB["ImapBackend"]
+        LLMB["LlmExtractor"]
+        CALB["Calendar 后端"]
     end
 
-    subgraph L3["③ 业务层"]
-        direction LR
-        SYNC["SyncEngine<br/>增量同步 · 分层台账"]
-        EXT["ExtractRunner<br/>预筛 → ICS → 规则 → LLM"]
-        REVQ["ReviewQueue<br/>审批 · 延迟窗口 · 冲突裁决"]
-        PUSHER["PushEngine<br/>受控写入 · 三方比对"]
-        READER["mark_read<br/>已读回写"]
-        MISC["threads ｜ digest ｜ audit ｜ stats<br/>会话重建 · 摘要 · 复盘 · 统计"]
+    subgraph OUT["外部系统与存储"]
+        DB[("SQLite")]
+        MAIL[("163 邮箱")]
+        LLMSVC[("LLM 服务")]
+        GCAL[("Google 日历")]
     end
 
-    subgraph L4["④ 适配层"]
-        direction LR
-        IMAPB["ImapBackend<br/>EXAMINE + BODY.PEEK"]
-        MIMEB["MIME 解析 / 清洗 / 头部解码"]
-        LLMB["LlmExtractor<br/>OpenAI 兼容"]
-        CALB["GCalBackend ｜ FakeCalendar<br/>CalendarBackend 协议"]
-    end
-
-    subgraph L5["⑤ 存储与外部系统"]
-        direction LR
-        DB[("SQLite · data/automail.db<br/>WAL · 前向迁移 · 自动备份")]
-        MAILSVC[("163 邮箱<br/>IMAP · 无 IDLE")]
-        LLMSVC[("LLM 服务<br/>境内优先")]
-        GCALSVC[("Google Calendar")]
-    end
-
-    CLIENTRY --> PIPE
-    TASKENTRY --> PIPE
-    GUIENTRY --> WORKER --> PIPE
-    PIPE --> SYNC & EXT & REVQ & PUSHER & READER & MISC
-    SYNC --> IMAPB --> MAILSVC
-    SYNC --> MIMEB
+    CLI --> PIPE
+    PIPE --> SYNC & EXT & REVQ & PUSH & MR
+    SYNC --> IMAPB --> MAIL
     EXT --> LLMB --> LLMSVC
-    PUSHER --> CALB --> GCALSVC
-    READER --> IMAPB
-    SYNC & EXT & REVQ & PUSHER & READER & MISC --> DB
+    PUSH --> CALB --> GCAL
+    MR --> IMAPB
+    SYNC & EXT & REVQ & PUSH -.-> DB
+
+    classDef entry fill:#e8f4ff,stroke:#4a90d9
+    classDef svc fill:#e9f7ef,stroke:#3d9970
+    classDef adp fill:#f3ecff,stroke:#8a63d2
+    classDef ext fill:#f0f0f0,stroke:#888,stroke-dasharray:4
+    class CLI,PIPE entry
+    class SYNC,EXT,REVQ,PUSH,MR svc
+    class IMAPB,LLMB,CALB adp
+    class DB,MAIL,LLMSVC,GCAL ext
 ```
+
+实线是「调用」，虚线是「读写本地状态」。每个业务模块只经由一个适配层实现
+触达外部系统（例如只有 `PushEngine` 会碰日历），因此后端可以整体替换成
+`FakeCalendar` 做演练。
+
+`threads` / `digest` / `audit` / `stats` 是只读旁路工具（读库、写本地文件），
+不参与主链路，故未画出。
+> 两张图都做了精简：`Windows 任务计划` 与 `GUI Worker` 只是入口层/编排层的另外两种驱动
+> 方式（前者走 `scripts/run.ps1` 调同一个 CLI，后者是 GUI 的后台线程），`MIME 解析`
+> 是 `SyncEngine` 内部的一步而非独立依赖，`threads / digest / audit / stats` 是旁路工具
+> 且不参与主链路——它们的细节见下方职责表与目录结构。
 
 ### 分层职责
 
@@ -150,41 +157,49 @@ scripts/                   任务计划安装 / 构建 / 运行包装
 四道关口。**写邮箱和写日历是两个方向的尽头**，中间全部是可回滚的本地状态。
 
 ```mermaid
-flowchart LR
-    MAIL[("163 邮箱<br/>INBOX")]
-
-    SYNC["SyncEngine<br/>增量同步"]
-    MSG[("messages<br/>脱敏正文片段 + 全文哈希")]
-    EXT["ExtractRunner<br/>抽取候选事件"]
-    EV[("events<br/>pending")]
-    REVQ{"人工审批<br/>approve / reject<br/>edit / ignore"}
-    TERM[("终态<br/>rejected / ignored")]
-    APPROVED[("events<br/>approved")]
-    SCHED[("scheduled_pushes<br/>延迟窗口队列")]
-    PUSH["PushEngine<br/>受控写入"]
+flowchart TB
+    MAIL[("163 邮箱")]
+    SYNC["SyncEngine"]
+    EXT["ExtractRunner"]
+    REVQ{"人工审批"}
+    PUSH["PushEngine"]
     CAL[("Google 日历")]
+    DB[("SQLite<br/>messages / events")]
+    SCHED["scheduled_pushes<br/>延迟窗口"]
+    MR["mark_read"]
 
-    MR["mark_read<br/>已读回写"]
-    OUT["out/<br/>摘要 · 复盘报告"]
-    AUD["audit<br/>只读复盘"]
+    MAIL -->|"只读同步"| SYNC
+    SYNC -->|"脱敏入库"| EXT
+    EXT -->|"候选事件"| REVQ
+    REVQ -->|"approved"| PUSH
+    PUSH -->|"受控写入"| CAL
 
-    MAIL -->|"EXAMINE + BODY.PEEK<br/>严格只读"| SYNC
-    SYNC -->|"清洗脱敏后入库"| MSG
-    MSG --> EXT --> EV
-    EV --> REVQ
-    REVQ -->|"approve / edit"| APPROVED
-    REVQ -->|"reject / ignore"| TERM
-    APPROVED -->|"人工批准：立即"| PUSH
-    EV -.->|"自动白名单<br/>进入延迟窗口"| SCHED
+    REVQ -.->|"白名单进窗口"| SCHED
     SCHED -.->|"到点 dispatch"| PUSH
-    PUSH -->|"幂等反查 + 三方比对"| CAL
-    PUSH -.->|"回写 gcal_event_id<br/>快照哈希 · 冻结标记"| EV
-    EV -.-> AUD
-    AUD -.-> OUT
-    PUSH -.->|"摘要 / 待审页面"| OUT
-    EXT -.->|"事件状态决定<br/>哪些算「已处理完」"| MR
-    MR -.->|"只改 Seen 一个标志<br/>MARK_READ_POLICY 默认 off"| MAIL
+    EXT -.->|"判定已处理"| MR
+    MR -.->|"标为已读"| MAIL
+
+    SYNC & EXT & REVQ & PUSH -.-> DB
+
+    classDef svc fill:#e9f7ef,stroke:#3d9970
+    classDef store fill:#fff3cd,stroke:#d4a017
+    classDef ext fill:#f0f0f0,stroke:#888,stroke-dasharray:4
+    classDef warn fill:#ffe8e8,stroke:#d9534f
+    class SYNC,EXT,PUSH,REVQ svc
+    class DB,SCHED store
+    class MAIL,CAL ext
+    class MR warn
 ```
+
+实线是**主链路**，虚线是**反馈与旁路**。为控制在可读的尺寸内，两处细节移到这里
+（图示已按 skill 的「宁可丢进正文，不要塞进图里」处理）：
+
+* **同步取信的确切方式**是 `EXAMINE`（只读选中）+ `BODY.PEEK[]`（不置已读标志），
+  全程不发任何 STORE；这是「邮箱默认只读」的实现基础。
+* **`events.status` 的中间态**（`pending` / `approved` / `pushed` / `push_failed` / 冻结态…）
+  都落在同一个 `events` 表里，上图合并为 `DB` 一个节点；完整转移见下方状态机。
+* **旁路工具**（`audit` → `out/` 报告、`digest` 摘要、`threads` 线程重建）不参与主链路，
+  只读库并写本地文件，故未画出。
 
 读这张图的三个要点：
 
@@ -199,30 +214,44 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    START["邮件已入库"] --> PF{"预筛器 classify<br/>是否值得抽取?"}
-    PF -->|"不值得"| SKIPPF["跳过<br/>通知 / 营销噪音"]
-    PF -->|"值得"| HICS{"有可解析的<br/>ICS 部件?"}
+    PF{"预筛<br/>值得抽取?"}
+    SKIP["跳过<br/>记录原因"]
+    ICS["ICS 直解<br/>零 LLM"]
+    RULE["规则引擎"]
+    LLM["LLM 兜底<br/>恒待审"]
+    SKIPLLM["跳过 LLM<br/>如实记录"]
+    MERGE["合并去重"]
+    CONFL{"同日时刻冲突?"}
+    PEND["转待审<br/>标记冲突"]
+    WL{"满足白名单?"}
+    AUTO["approved<br/>经延迟窗口"]
+    MAN["pending<br/>待人工审批"]
 
-    HICS -->|"是"| ICSRES["ICS 直解<br/>零 LLM · 置信度 0.99"]
-    HICS -->|"否"| RULES["规则引擎<br/>确定性日期匹配 + 打分"]
+    PF -->|"否"| SKIP
+    PF -->|"是"| ICS
+    ICS -.->|"无 ICS 部件"| RULE
+    RULE -.->|"规则不可用"| LLM
+    LLM -.->|"凭据缺失"| SKIPLLM
+    ICS --> MERGE
+    RULE --> MERGE
+    LLM --> MERGE
+    MERGE --> CONFL
+    CONFL -->|"是"| PEND
+    CONFL -->|"否"| WL
+    PEND --> WL
+    WL -->|"是"| AUTO
+    WL -->|"否"| MAN
 
-    RULES --> USABLE{"规则给出<br/>可用结果?"}
-    USABLE -->|"是"| MERGE
-    USABLE -->|"否"| ASKLLM{"预筛认为值得调 LLM<br/>且凭据可用?"}
-    ASKLLM -->|"是"| LLMRES["LLM 抽取<br/>恒为待审"]
-    ASKLLM -->|"否"| SKIPLLM["跳过 LLM<br/>如实记入 llm_skipped_reason"]
-
-    ICSRES --> MERGE["跨来源去重<br/>ICS > RULES > LLM"]
-    LLMRES --> MERGE
-    MERGE --> CONFL{"同日存在多个<br/>不一致时刻?"}
-    CONFL -->|"是"| FORCE["全部转为待审<br/>标记来源冲突"]
-    CONFL -->|"否"| CAND
-    FORCE --> CAND["候选事件"]
-
-    CAND --> WL{"满足自动入历白名单?"}
-    WL -->|"是"| AUTO["approved<br/>经延迟窗口"]
-    WL -->|"否"| MANUAL["pending<br/>等待人工审批"]
+    classDef svc fill:#e9f7ef,stroke:#3d9970
+    classDef skip fill:#f0f0f0,stroke:#888,stroke-dasharray:4
+    classDef store fill:#fff3cd,stroke:#d4a017
+    class ICS,RULE,LLM,MERGE svc
+    class SKIP,SKIPLLM,PEND skip
+    class AUTO,MAN store
 ```
+
+ICS / 规则 / LLM 三者是**降级关系**（虚线：上一级拿不到结果才走下一级），
+但三者的产出都会进入合并去重——ICS 与规则可以同时命中同一封邮件。
 
 白名单（可直接 `approved`）只有两条，其余一律 `pending`：
 
@@ -236,37 +265,59 @@ flowchart TB
 
 `events.status` 是唯一状态源；`scheduled_pushes.state` 只是调度队列，不属于本状态机。
 
+状态机按「正常路径」与「异常/冻结路径」拆成两张，因为 12 个状态放进一张图后
+会宽到无法阅读。
+
+**正常路径与终态**：
+
 ```mermaid
 stateDiagram-v2
+    direction TB
     [*] --> pending: 抽取得到候选
-
-    pending --> approved: approve 或 edit
-    pending --> rejected: reject 终态
-    pending --> ignored: ignore 终态
-
+    pending --> approved: approve / edit
+    pending --> rejected: reject
+    pending --> ignored: ignore
     approved --> pushed: push 成功
-    approved --> push_failed: push 失败
-    approved --> missing: 远端 404
-    approved --> cancelled: archive 归档 / --cancel
-    approved --> externally_modified: 仅远端被改动
-    approved --> conflict: 远端与本地都改动
-
-    push_failed --> approved: retry 或下轮重试
-    push_failed --> push_failed: 超 PUSH_MAX_ATTEMPTS<br/>置 needs_attention
-    missing --> approved: events retry
-
-    pushed --> externally_modified: 检测到用户手改
-    pushed --> conflict: 双方都有改动
-    pushed --> cancelled: archive 归档式取消
-
-    externally_modified --> approved: adopt 接管解冻
-    conflict --> approved: adopt 接管解冻
-
-    cancelled --> pending: push --cancel 撤销
-    cancelled --> [*]
     rejected --> [*]
     ignored --> [*]
+
+    classDef ok fill:#e9f7ef,stroke:#3d9970
+    classDef term fill:#f0f0f0,stroke:#888
+    class pushed ok
+    class rejected,ignored term
 ```
+
+**异常与冻结路径**（全部从 `approved` / `pushed` 出发，且大多能回到 `approved`）：
+
+```mermaid
+stateDiagram-v2
+    direction TB
+    approved --> push_failed: push 失败
+    approved --> missing: 远端 404
+    approved --> externally_modified: 仅远端被改动
+    approved --> conflict: 双方都改动
+    approved --> cancelled: archive / --cancel
+
+    push_failed --> approved: retry
+    missing --> approved: retry
+    externally_modified --> approved: adopt
+    conflict --> approved: adopt
+    cancelled --> pending: --cancel 撤销
+
+    note right of push_failed
+        连续失败达上限后
+        置 needs_attention
+    end note
+
+    classDef frozen fill:#ffe8e8,stroke:#d9534f
+    classDef warn fill:#fff3cd,stroke:#d4a017
+    class externally_modified,conflict frozen
+    class push_failed,missing,cancelled warn
+```
+
+`pushed` 上还挂着三条同类转移（检测到手改 → `externally_modified`、双方都改 →
+`conflict`、`archive` → `cancelled`），与上图 `approved` 出发的三条完全对应，
+故未重复画出。
 
 **冻结态**（`externally_modified`、`conflict`）禁止任何 update/delete。
 唯一的出路是 `adopt`（以当前远端为新基线，承认用户的改动，回到 `approved`）。
@@ -295,50 +346,34 @@ stateDiagram-v2
 ```mermaid
 sequenceDiagram
     autonumber
-    participant T as 任务计划 / CLI / GUI
+    participant T as 调度器
     participant P as Pipeline
     participant L as locks 表
-    participant S as SyncEngine
-    participant E as ExtractRunner
-    participant U as PushEngine
-    participant R as mark_read
-    participant M as 163 IMAP
-    participant G as Google Calendar
+    participant W as 各阶段引擎
+    participant X as 邮箱 / 日历
 
     T->>P: run --apply
-    P->>L: acquire TTL 单实例锁
-
+    P->>L: 抢单实例锁
     alt 上一轮仍在运行
         L-->>P: 未获得
-        P-->>T: 退出码 1，不执行任何阶段
-        Note over P,T: 重叠调度是正常情况，不是错误
+        P-->>T: 退出码 1
+        Note over P,T: 重叠调度属正常，不执行任何阶段
     else 获得锁
         L-->>P: ok
-        P->>S: stage sync
-        S->>M: EXAMINE + UID SEARCH + BODY.PEEK
-        M-->>S: 邮件原文
-        S-->>P: 入库并记账
-        Note over S,P: 失败只记为部分完成，不阻断后续
-
-        P->>E: stage extract
-        E-->>P: 候选事件
-        Note over E,P: LLM 不可用则降级为仅规则
-
-        P->>U: stage push
-        U->>G: find_by_auto_mail_key 反查
-        G-->>U: 命中则回填，未命中才 insert
-        U->>G: get → 三方比对 → update
-        G-->>U: 远端事件 / 404 / 冲突
-        U-->>P: created / backfilled / frozen / failed
-
-        P->>R: stage mark-read
-        R->>M: STORE +FLAGS Seen
-        Note over R,M: 仅在开启且 UIDVALIDITY 一致时执行
-
-        P->>L: release
-        P-->>T: 退出码取最严重阶段
+        P->>W: sync → extract → push
+        W->>X: PEEK 只读取信 / 受控写入
+        X-->>W: 邮件原文 / 写入结果
+        Note over W: 任一阶段失败不阻断后续
+        P->>W: mark-read
+        W->>X: 标为已读（仅开启时）
+        P->>L: 释放
+        P-->>T: 最严重退出码
     end
 ```
+
+四个阶段各自与外部系统的具体调用（同步用 `EXAMINE` + `BODY.PEEK`、
+推送先按 `auto_mail_key` 反查再写入等）在上文的架构图与数据流图里已标注；
+时序图这里合并为「各阶段引擎」以保证可读性。
 
 两层防线，缺一不可：
 
@@ -468,26 +503,33 @@ automail stats                 # 查看只读统计
 
 ```mermaid
 flowchart LR
-    subgraph MT["主线程 —— 唯一允许操作 Tk"]
-        POLL["App._poll()<br/>root.after 100ms"]
-        PL["六个面板<br/>overview / review / mail<br/>calendar / audit / settings"]
+    subgraph MT["主线程 · 唯一可操作 Tk"]
+        POLL["App._poll()<br/>after 100ms"]
+        PL["六个面板"]
     end
 
-    subgraph BT["后台线程 —— 非守护线程"]
-        WK["Worker<br/>提交 / 忙碌判定 / 关闭"]
-        JOB["Pipeline · 复盘 · 备份 …"]
+    subgraph BT["后台线程 · 非守护"]
+        WK["Worker"]
+        JOB["Pipeline / 复盘 / 备份"]
     end
 
     Q[("queue")]
 
-    WK -->|"TaskResult / ProgressEvent / LogRecord"| Q
+    WK -->|"TaskResult<br/>ProgressEvent<br/>LogRecord"| Q
     Q --> POLL --> PL
-    PL -->|"submit 任务函数"| WK --> JOB
+    PL -->|"submit 任务"| WK --> JOB
 
-    STATE["AppState<br/>连接与刷新 · 无 Tk"]
-    VM["viewmodels<br/>纯函数 · 无 Tk"]
+    STATE["AppState<br/>无 Tk"]
+    VM["viewmodels<br/>无 Tk"]
     STATE --> PL
     VM --> PL
+
+    classDef ui fill:#e8f4ff,stroke:#4a90d9
+    classDef bg fill:#e9f7ef,stroke:#3d9970
+    classDef pure fill:#fff3cd,stroke:#d4a017
+    class POLL,PL ui
+    class WK,JOB bg
+    class STATE,VM pure
 ```
 
 三条实现约束（都有具体理由，不是风格偏好）：
